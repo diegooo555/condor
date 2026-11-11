@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,13 +26,17 @@ import (
 )
 
 // version: cámbiala en cada despliegue para saber qué build está corriendo.
-const version = "cert-fix-aia-1"
+const version = "login-cookie-1"
 
 var (
 	mu          sync.Mutex
-	pendientes  = map[string]string{} // state -> verifier (logins a medias)
 	ultimoToken *auth.Token
 )
+
+// cookieLogin guarda el PKCE del login a medias ("state.verifier").
+// Va en una cookie, no en memoria, para sobrevivir a que Render apague la
+// instancia (plan free) entre abrir el login y pegar la URL de regreso.
+const cookieLogin = "login_pkce"
 
 func main() {
 	// Comando aparte: descarga los certificados que la UPTC no envía completos.
@@ -119,13 +124,25 @@ func inicio(w http.ResponseWriter, r *http.Request) {
   </form></div>%s`, estado, formulario))
 }
 
-// login: arma la URL con PKCE, recuerda el verifier y redirige a la UPTC.
+// login: arma la URL con PKCE, recuerda el verifier en una cookie y redirige.
 func login(w http.ResponseWriter, r *http.Request) {
 	urlLogin, verifier, state := auth.URLLogin()
-	mu.Lock()
-	pendientes[state] = verifier
-	mu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieLogin,
+		Value:    state + "." + verifier,
+		Path:     "/",
+		MaxAge:   900, // 15 min para completar el login
+		HttpOnly: true,
+		Secure:   esHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(w, r, urlLogin, http.StatusFound)
+}
+
+// esHTTPS detecta TLS incluso detrás del proxy de Render (termina TLS y reenvía
+// por HTTP con la cabecera X-Forwarded-Proto). En local (http) devuelve false.
+func esHTTPS(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
 }
 
 // callback: recibe la URL pegada, saca el code y lo cambia por el token.
@@ -134,22 +151,29 @@ func callback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	code, err := auth.ExtraerCode(r.FormValue("url"))
+	urlPegada := r.FormValue("url")
+	code, err := auth.ExtraerCode(urlPegada)
 	if err != nil {
 		paginaError(w, err.Error())
 		return
 	}
-	// Tomamos cualquier verifier pendiente (solo hay uno a la vez en uso normal).
-	mu.Lock()
-	var verifier string
-	for s, v := range pendientes {
-		verifier = v
-		delete(pendientes, s)
-		break
+
+	c, err := r.Cookie(cookieLogin)
+	if err != nil || c.Value == "" {
+		paginaError(w, "No hay un login en curso (o ya expiró). Da clic en 'Abrir login UPTC' y pega la URL dentro de los 15 minutos.")
+		return
 	}
-	mu.Unlock()
-	if verifier == "" {
-		paginaError(w, "No hay un login en curso. Da clic en 'Abrir login UPTC' primero.")
+	// El code es de un solo uso: borramos la cookie apenas la tomamos.
+	http.SetCookie(w, &http.Cookie{Name: cookieLogin, Path: "/", MaxAge: -1})
+
+	state, verifier, ok := strings.Cut(c.Value, ".")
+	if !ok || verifier == "" {
+		paginaError(w, "La sesión de login quedó incompleta. Inicia el login de nuevo.")
+		return
+	}
+	// El state que generamos debe venir de regreso en la URL (anti-CSRF).
+	if !strings.Contains(urlPegada, state) {
+		paginaError(w, "La URL no corresponde a este login. Abre 'Abrir login UPTC' y pega la URL de esa misma pestaña.")
 		return
 	}
 
