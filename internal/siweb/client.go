@@ -13,6 +13,9 @@ import (
 
 const baseURL = "https://apps3.uptc.edu.co/SiWebEstudianteBackEnd"
 
+// carnetURL es otro servicio (carnetización), que entrega la foto en JPEG.
+const carnetURL = "https://servicios3.uptc.edu.co/SiCarnetizacion-service"
+
 // Cliente guarda el token (y opcionalmente la cookie) para reusarlos en cada petición.
 type Cliente struct {
 	Token  string
@@ -59,6 +62,14 @@ func (c *Cliente) Perfil(correo string) ([]byte, int, error) {
 	q := url.Values{}
 	q.Set("busqueda", correo)
 	endpoint := baseURL + "/estudiante/EstudianteMail?" + q.Encode()
+	return c.get(endpoint)
+}
+
+// FotoCarne descarga la foto del carné de un estudiante por su código.
+// La respuesta es binaria (JPEG), no JSON: se devuelven los bytes tal cual.
+func (c *Cliente) FotoCarne(estudiante string) ([]byte, int, error) {
+	estudiante = strings.TrimSpace(estudiante)
+	endpoint := carnetURL + "/imgFotCarne/veriFot/" + url.PathEscape(estudiante)
 	return c.get(endpoint)
 }
 

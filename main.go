@@ -19,9 +19,13 @@ import (
 	"time"
 
 	"awesomeProject/internal/auth"
+	"awesomeProject/internal/httpx"
 	"awesomeProject/internal/siweb"
 	"awesomeProject/internal/vista"
 )
+
+// version: cámbiala en cada despliegue para saber qué build está corriendo.
+const version = "cert-fix-aia-1"
 
 var (
 	mu          sync.Mutex
@@ -53,8 +57,10 @@ func main() {
 	mux.HandleFunc("/horario", horario)
 	mux.HandleFunc("/notas", notas)
 	mux.HandleFunc("/perfil", perfil)
+	mux.HandleFunc("/foto", foto)
+	mux.HandleFunc("/salud", salud)
 
-	log.Printf("Servicio escuchando en el puerto %s", port)
+	log.Printf("Servicio escuchando en el puerto %s (build %s)", port, version)
 	log.Fatal(http.ListenAndServe(":"+port, protegido(os.Getenv("APP_PASSWORD"), mux)))
 }
 
@@ -93,6 +99,11 @@ func inicio(w http.ResponseWriter, r *http.Request) {
   <form method="post" action="/perfil">
     <p>Correo UPTC: <input type="text" name="correo" placeholder="diego.sanchez20" required></p>
     <p><button>Ver datos</button></p>
+  </form></div>
+<div class="caja"><h2>5. Foto del carné</h2>
+  <form method="post" action="/foto">
+    <p>Código del estudiante: <input type="text" name="estudiante" placeholder="202322204" required></p>
+    <p><button>Ver foto</button></p>
   </form></div>`
 	}
 
@@ -277,6 +288,47 @@ func perfil(w http.ResponseWriter, r *http.Request) {
 		vista.PerfilHTML(p)))
 }
 
+// foto: renueva el token si venció y muestra la foto del carné del estudiante.
+func foto(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	t, err := tokenValido()
+	if err != nil {
+		paginaError(w, err.Error())
+		return
+	}
+
+	estudiante := r.FormValue("estudiante")
+	cliente := siweb.Nuevo(t.AccessToken, "")
+	body, codigoHTTP, err := cliente.FotoCarne(estudiante)
+	if err != nil {
+		paginaError(w, "Error al consultar: "+err.Error())
+		return
+	}
+	if codigoHTTP == 401 {
+		paginaError(w, "El token no fue aceptado. Inicia sesión de nuevo.")
+		return
+	}
+
+	// Una respuesta válida es un JPEG (empieza con FF D8). Si no lo es (un error
+	// en JSON, un vacío, etc.), mostramos el cuerpo crudo para poder depurar.
+	esJPEG := len(body) >= 2 && body[0] == 0xFF && body[1] == 0xD8
+	if codigoHTTP != http.StatusOK || !esJPEG {
+		pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Resultado (HTTP %d)</h2>
+  <textarea readonly style="height:360px">%s</textarea>
+  <p><a href="/">Volver</a></p></div>`, codigoHTTP, html.EscapeString(bonito(body))))
+		return
+	}
+
+	pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Foto del carné</h2>%s
+  <p><a href="/">Volver / consultar otro</a></p></div>`,
+		vista.FotoHTML(estudiante, body)))
+}
+
 // tokenValido devuelve un token usable, renovándolo si hace falta.
 func tokenValido() (*auth.Token, error) {
 	mu.Lock()
@@ -321,6 +373,22 @@ func pagina(w http.ResponseWriter, status int, contenido string) {
 
 func paginaError(w http.ResponseWriter, msg string) {
 	pagina(w, http.StatusBadRequest, `<p class="error">`+html.EscapeString(msg)+`</p><p><a href="/">Volver</a></p>`)
+}
+
+// salud dice qué build corre y si la conexión TLS con la UPTC verifica bien,
+// sin necesidad de iniciar sesión. Útil para depurar despliegues en Render.
+func salud(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintf(w, "build: %s\n", version)
+
+	url := "https://auth.uptc.edu.co/auth/realms/UPTC/.well-known/openid-configuration"
+	resp, err := httpx.Cliente().Get(url)
+	if err != nil {
+		fmt.Fprintf(w, "TLS con la UPTC: ERROR\n%v\n", err)
+		return
+	}
+	resp.Body.Close()
+	fmt.Fprintf(w, "TLS con la UPTC: OK (HTTP %d)\n", resp.StatusCode)
 }
 
 // cacert se conecta a los servidores de la UPTC, sigue la cadena de certificados
