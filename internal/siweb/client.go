@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
+
+	"awesomeProject/internal/httpx"
 )
 
 const baseURL = "https://apps3.uptc.edu.co/SiWebEstudianteBackEnd"
@@ -24,7 +25,7 @@ func Nuevo(token, cookie string) *Cliente {
 	return &Cliente{
 		Token:  strings.TrimSpace(token),
 		Cookie: strings.TrimSpace(cookie),
-		http:   &http.Client{Timeout: 20 * time.Second},
+		http:   httpx.Cliente(),
 	}
 }
 

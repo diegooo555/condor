@@ -5,9 +5,13 @@ package main
 import (
 	"bytes"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"html"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -26,6 +30,12 @@ var (
 )
 
 func main() {
+	// Comando aparte: descarga los certificados que la UPTC no envía completos.
+	if len(os.Args) > 1 && os.Args[1] == "cacert" {
+		cacert()
+		return
+	}
+
 	// Si quedó un token guardado de antes, lo cargamos al arrancar.
 	if t, err := auth.Cargar(); err == nil {
 		ultimoToken = t
@@ -311,6 +321,80 @@ func pagina(w http.ResponseWriter, status int, contenido string) {
 
 func paginaError(w http.ResponseWriter, msg string) {
 	pagina(w, http.StatusBadRequest, `<p class="error">`+html.EscapeString(msg)+`</p><p><a href="/">Volver</a></p>`)
+}
+
+// cacert se conecta a los servidores de la UPTC, sigue la cadena de certificados
+// y guarda en certs/uptc.pem los intermedios/raíz que hacen falta para verificar.
+func cacert() {
+	hosts := []string{"auth.uptc.edu.co:443", "apps3.uptc.edu.co:443"}
+	var buf bytes.Buffer
+	vistos := map[string]bool{}
+
+	for _, h := range hosts {
+		conn, err := tls.Dial("tcp", h, &tls.Config{InsecureSkipVerify: true}) // solo para LEER el certificado
+		if err != nil {
+			fmt.Printf("No pude conectar a %s: %v\n", h, err)
+			continue
+		}
+		cadena := conn.ConnectionState().PeerCertificates
+		conn.Close()
+		if len(cadena) == 0 {
+			continue
+		}
+
+		// Seguimos la cadena hacia arriba usando la extensión AIA del certificado.
+		actual := cadena[0]
+		for i := 0; i < 6; i++ {
+			if len(actual.IssuingCertificateURL) == 0 {
+				break
+			}
+			inter, err := bajarCert(actual.IssuingCertificateURL[0])
+			if err != nil {
+				fmt.Printf("No pude bajar un certificado de %s: %v\n", h, err)
+				break
+			}
+			if !vistos[string(inter.Raw)] {
+				vistos[string(inter.Raw)] = true
+				pem.Encode(&buf, &pem.Block{Type: "CERTIFICATE", Bytes: inter.Raw})
+				fmt.Println("Agregado:", inter.Subject.CommonName)
+			}
+			if inter.Subject.String() == inter.Issuer.String() {
+				break // llegamos a la raíz (auto-firmada)
+			}
+			actual = inter
+		}
+	}
+
+	if buf.Len() == 0 {
+		fmt.Println("No se descargó ningún certificado. Revisa tu conexión y vuelve a intentar.")
+		return
+	}
+	if err := os.MkdirAll("certs", 0o755); err != nil {
+		fmt.Println("No pude crear la carpeta certs:", err)
+		return
+	}
+	if err := os.WriteFile("certs/uptc.pem", buf.Bytes(), 0o644); err != nil {
+		fmt.Println("No pude escribir certs/uptc.pem:", err)
+		return
+	}
+	fmt.Println("\nListo: certs/uptc.pem creado. Súbelo al repositorio y vuelve a desplegar.")
+}
+
+// bajarCert descarga un certificado (DER o PEM) desde una URL y lo parsea.
+func bajarCert(url string) (*x509.Certificate, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	datos, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if blk, _ := pem.Decode(datos); blk != nil {
+		datos = blk.Bytes
+	}
+	return x509.ParseCertificate(datos)
 }
 
 func bonito(datos []byte) string {

@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"awesomeProject/internal/httpx"
 )
 
 const (
@@ -21,8 +23,6 @@ const (
 	redirectURI = "https://apps3.uptc.edu.co/SiWebEstudianteFrontEnd/"
 	scope       = "openid profile email"
 )
-
-var cliente = &http.Client{Timeout: 15 * time.Second}
 
 func aleatorio(n int) string {
 	b := make([]byte, n)
@@ -105,7 +105,7 @@ func Refrescar(refreshToken string) (*Token, error) {
 // pedirToken hace el POST al endpoint de token con las credenciales en el body.
 func pedirToken(params url.Values) (*Token, error) {
 	params.Set("client_id", clientID)
-	resp, err := cliente.PostForm(tokenURL, params)
+	resp, err := httpx.Cliente().PostForm(tokenURL, params)
 	if err != nil {
 		return nil, err
 	}
