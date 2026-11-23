@@ -8,9 +8,6 @@ import (
 	"time"
 )
 
-// Archivo donde se guarda el token, al lado del programa.
-const Archivo = "token.json"
-
 // Token es lo que devuelve la UPTC más la hora en que lo obtuvimos.
 type Token struct {
 	AccessToken  string `json:"access_token"`
@@ -30,18 +27,18 @@ func (t *Token) Expirado() bool {
 	return time.Now().After(vence.Add(-30 * time.Second))
 }
 
-// Guardar escribe el token en token.json. 0600 = solo tu usuario puede leerlo.
-func Guardar(t *Token) error {
+// Guardar escribe el token en el archivo del portal. 0600 = solo tu usuario lo lee.
+func (p *Portal) Guardar(t *Token) error {
 	datos, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(Archivo, datos, 0o600)
+	return os.WriteFile(p.Archivo, datos, 0o600)
 }
 
-// Cargar lee el token de token.json. Devuelve error si el archivo no existe.
-func Cargar() (*Token, error) {
-	datos, err := os.ReadFile(Archivo)
+// Cargar lee el token del archivo del portal. Devuelve error si no existe.
+func (p *Portal) Cargar() (*Token, error) {
+	datos, err := os.ReadFile(p.Archivo)
 	if err != nil {
 		return nil, err
 	}

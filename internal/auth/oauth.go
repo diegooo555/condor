@@ -17,11 +17,32 @@ import (
 )
 
 const (
-	authURL     = "https://auth.uptc.edu.co/auth/realms/UPTC/protocol/openid-connect/auth"
-	tokenURL    = "https://auth.uptc.edu.co/auth/realms/UPTC/protocol/openid-connect/token"
-	clientID    = "SiWebEstudiante-publico"
-	redirectURI = "https://apps3.uptc.edu.co/SiWebEstudianteFrontEnd/"
-	scope       = "openid profile email"
+	authURL  = "https://auth.uptc.edu.co/auth/realms/UPTC/protocol/openid-connect/auth"
+	tokenURL = "https://auth.uptc.edu.co/auth/realms/UPTC/protocol/openid-connect/token"
+	scope    = "openid profile email"
+)
+
+// Portal es un cliente OAuth de la UPTC. El servidor de autenticación (Keycloak,
+// realm UPTC) es el mismo para todos; solo cambian el client_id, el redirect_uri
+// y el archivo donde se guarda su token. Así estudiante y docente comparten TODO
+// el motor (PKCE, intercambio, refresh) sin duplicar una sola línea.
+type Portal struct {
+	ClientID    string
+	RedirectURI string
+	Archivo     string // token.json propio de este portal
+}
+
+var (
+	Estudiante = &Portal{
+		ClientID:    "SiWebEstudiante-publico",
+		RedirectURI: "https://apps3.uptc.edu.co/SiWebEstudianteFrontEnd/",
+		Archivo:     "token.json",
+	}
+	Docente = &Portal{
+		ClientID:    "SiWebDocente-publico",
+		RedirectURI: "https://apps3.uptc.edu.co/SiWebDocenteFrontEnd/#/", // el #/ va idéntico
+		Archivo:     "token_docente.json",
+	}
 )
 
 func aleatorio(n int) string {
@@ -39,13 +60,13 @@ func challengeDe(verifier string) string {
 
 // URLLogin arma la URL de autorización con PKCE y devuelve también el verifier
 // y el state (hay que recordarlos para el intercambio del código).
-func URLLogin() (urlLogin, verifier, state string) {
+func (p *Portal) URLLogin() (urlLogin, verifier, state string) {
 	verifier = aleatorio(48)
 	state = aleatorio(16)
 	q := url.Values{
-		"client_id":             {clientID},
+		"client_id":             {p.ClientID},
 		"response_type":         {"code"},
-		"redirect_uri":          {redirectURI},
+		"redirect_uri":          {p.RedirectURI},
 		"scope":                 {scope},
 		"state":                 {state},
 		"code_challenge":        {challengeDe(verifier)},
@@ -64,7 +85,9 @@ func ExtraerCode(pegada string) (string, error) {
 	actual := u
 	for i := 0; i < 4 && actual != nil; i++ {
 		datos := actual.Query()
-		if frag, err := url.ParseQuery(actual.Fragment); err == nil {
+		// El fragmento puede venir como "#/", "#/?code=..." o "#/&code=..."
+		// (portal docente). Quitamos el "/" o "?" inicial antes de parsear.
+		if frag, err := url.ParseQuery(strings.TrimLeft(actual.Fragment, "/?")); err == nil {
 			for k, v := range frag {
 				datos[k] = v
 			}
@@ -85,25 +108,25 @@ func ExtraerCode(pegada string) (string, error) {
 }
 
 // IntercambiarCode cambia el código por el token.
-func IntercambiarCode(code, verifier string) (*Token, error) {
-	return pedirToken(url.Values{
+func (p *Portal) IntercambiarCode(code, verifier string) (*Token, error) {
+	return pedirToken(p.ClientID, url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
-		"redirect_uri":  {redirectURI},
+		"redirect_uri":  {p.RedirectURI},
 		"code_verifier": {verifier},
 	})
 }
 
 // Refrescar saca un token nuevo usando el refresh_token (sin volver a iniciar sesión).
-func Refrescar(refreshToken string) (*Token, error) {
-	return pedirToken(url.Values{
+func (p *Portal) Refrescar(refreshToken string) (*Token, error) {
+	return pedirToken(p.ClientID, url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
 	})
 }
 
 // pedirToken hace el POST al endpoint de token con las credenciales en el body.
-func pedirToken(params url.Values) (*Token, error) {
+func pedirToken(clientID string, params url.Values) (*Token, error) {
 	params.Set("client_id", clientID)
 	resp, err := httpx.Cliente().PostForm(tokenURL, params)
 	if err != nil {

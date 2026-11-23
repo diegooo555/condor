@@ -26,17 +26,36 @@ import (
 )
 
 // version: cámbiala en cada despliegue para saber qué build está corriendo.
-const version = "login-cookie-1"
+const version = "docente-views-1"
+
+// sesion es un portal con su estado: el cliente OAuth, el token en vivo y el
+// nombre de su cookie de login. Hay una por portal (estudiante y docente), así
+// las dos sesiones conviven sin pisarse.
+type sesion struct {
+	portal *auth.Portal
+	cookie string // nombre de la cookie que guarda el PKCE del login a medias
+	nombre string // etiqueta para los mensajes
+	mu     sync.Mutex
+	token  *auth.Token
+}
 
 var (
-	mu          sync.Mutex
-	ultimoToken *auth.Token
+	est = &sesion{portal: auth.Estudiante, cookie: "login_pkce_est", nombre: "estudiante"}
+	doc = &sesion{portal: auth.Docente, cookie: "login_pkce_doc", nombre: "docente"}
 )
 
-// cookieLogin guarda el PKCE del login a medias ("state.verifier").
-// Va en una cookie, no en memoria, para sobrevivir a que Render apague la
-// instancia (plan free) entre abrir el login y pegar la URL de regreso.
-const cookieLogin = "login_pkce"
+func (s *sesion) actual() *auth.Token {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token
+}
+
+func (s *sesion) guardar(t *auth.Token) {
+	s.mu.Lock()
+	s.token = t
+	s.mu.Unlock()
+	_ = s.portal.Guardar(t)
+}
 
 func main() {
 	// Comando aparte: descarga los certificados que la UPTC no envía completos.
@@ -45,9 +64,13 @@ func main() {
 		return
 	}
 
-	// Si quedó un token guardado de antes, lo cargamos al arrancar.
-	if t, err := auth.Cargar(); err == nil {
-		ultimoToken = t
+	// Si quedó un token guardado de antes, lo cargamos al arrancar (cada portal
+	// tiene su propio archivo; si uno no existe, simplemente queda sin sesión).
+	if t, err := est.portal.Cargar(); err == nil {
+		est.token = t
+	}
+	if t, err := doc.portal.Cargar(); err == nil {
+		doc.token = t
 	}
 
 	port := os.Getenv("PORT")
@@ -57,12 +80,18 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", inicio)
-	mux.HandleFunc("/login", login)
-	mux.HandleFunc("/callback", callback)
+	// Estudiante
+	mux.HandleFunc("/login", est.login)
+	mux.HandleFunc("/callback", est.callback)
 	mux.HandleFunc("/horario", horario)
 	mux.HandleFunc("/notas", notas)
 	mux.HandleFunc("/perfil", perfil)
 	mux.HandleFunc("/foto", foto)
+	// Docente (mismo motor OAuth, otro client_id/redirect_uri)
+	mux.HandleFunc("/login-docente", doc.login)
+	mux.HandleFunc("/callback-docente", doc.callback)
+	mux.HandleFunc("/horario-docente", horarioDocente)
+	mux.HandleFunc("/calificaciones", calificaciones)
 	mux.HandleFunc("/salud", salud)
 
 	log.Printf("Servicio escuchando en el puerto %s (build %s)", port, version)
@@ -76,19 +105,54 @@ func inicio(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	mu.Lock()
-	t := ultimoToken
-	mu.Unlock()
 
-	estado := `<p>Todavía no has iniciado sesión.</p>`
-	formulario := ""
-	if t != nil {
-		vence := "desconocido"
-		if t.ObtenidoUnix > 0 && t.ExpiresIn > 0 {
-			vence = time.Unix(t.ObtenidoUnix, 0).Add(time.Duration(t.ExpiresIn) * time.Second).Format("15:04:05")
-		}
-		estado = fmt.Sprintf(`<p class="ok">Sesión activa. El token de acceso vence ~%s (se renueva solo).</p>`, vence)
-		formulario = `
+	// --- Portal estudiante ---
+	tEst := est.actual()
+	pagHTML := cajaLogin("1. Iniciar sesión — estudiante", "/login", "/callback",
+		"https://apps3.uptc.edu.co/SiWebEstudianteFrontEnd/?...code=...", estadoSesion(tEst))
+	if tEst != nil {
+		pagHTML += formulariosEstudiante
+	}
+
+	// --- Portal docente ---
+	tDoc := doc.actual()
+	pagHTML += cajaLogin("Iniciar sesión — docente", "/login-docente", "/callback-docente",
+		"https://apps3.uptc.edu.co/SiWebDocenteFrontEnd/#/...code=...", estadoSesion(tDoc))
+	if tDoc != nil {
+		pagHTML += formulariosDocente
+	}
+
+	pagina(w, http.StatusOK, pagHTML)
+}
+
+// estadoSesion resume si el portal tiene sesión activa y cuándo vence el token.
+func estadoSesion(t *auth.Token) string {
+	if t == nil {
+		return `<p>Todavía no has iniciado sesión.</p>`
+	}
+	vence := "desconocido"
+	if t.ObtenidoUnix > 0 && t.ExpiresIn > 0 {
+		vence = time.Unix(t.ObtenidoUnix, 0).Add(time.Duration(t.ExpiresIn) * time.Second).Format("15:04:05")
+	}
+	return fmt.Sprintf(`<p class="ok">Sesión activa. El token de acceso vence ~%s (se renueva solo).</p>`, vence)
+}
+
+// cajaLogin dibuja el recuadro de "abrir login + pegar URL" de un portal.
+func cajaLogin(titulo, loginPath, callbackPath, placeholder, estado string) string {
+	return fmt.Sprintf(`
+<div class="caja"><h2>%s</h2>
+  %s
+  <p>Se abre el login de la UPTC en otra pestaña. Entra con tu usuario de SiWeb,
+  y cuando termines (aunque salga un 502) copia la URL COMPLETA de la barra y pégala aquí:</p>
+  <p><a class="boton" href="%s" target="_blank">Abrir login UPTC</a></p>
+  <form method="post" action="%s">
+    <input type="text" name="url" placeholder="%s" required>
+    <p><button>Guardar sesión</button></p>
+  </form></div>`, titulo, estado, loginPath, callbackPath, placeholder)
+}
+
+// formulariosEstudiante son las consultas disponibles una vez con sesión de estudiante.
+const formulariosEstudiante = `
 <div class="caja"><h2>2. Horario</h2>
   <form method="post" action="/horario">
     <p>Periodo: <input type="text" name="periodo" placeholder="263" required></p>
@@ -110,25 +174,31 @@ func inicio(w http.ResponseWriter, r *http.Request) {
     <p>Código del estudiante: <input type="text" name="estudiante" placeholder="202322204" required></p>
     <p><button>Ver foto</button></p>
   </form></div>`
-	}
 
-	pagina(w, http.StatusOK, fmt.Sprintf(`
-<div class="caja"><h2>1. Iniciar sesión</h2>
-  %s
-  <p>Se abre el login de la UPTC en otra pestaña. Entra con tu usuario de SiWeb,
-  y cuando termines (aunque salga un 502) copia la URL COMPLETA de la barra y pégala aquí:</p>
-  <p><a class="boton" href="/login" target="_blank">Abrir login UPTC</a></p>
-  <form method="post" action="/callback">
-    <input type="text" name="url" placeholder="https://apps3.uptc.edu.co/SiWebEstudianteFrontEnd/?...code=..." required>
-    <p><button>Guardar sesión</button></p>
-  </form></div>%s`, estado, formulario))
-}
+// formulariosDocente son las consultas disponibles una vez con sesión de docente.
+const formulariosDocente = `
+<div class="caja"><h2>Horario docente</h2>
+  <form method="post" action="/horario-docente">
+    <p>Periodo (idPeriodo): <input type="text" name="periodo" placeholder="253" required></p>
+    <p>ID del profesor (idProfesor): <input type="text" name="profesor" placeholder="6775483" required></p>
+    <p><button>Ver horario</button></p>
+  </form></div>
+<div class="caja"><h2>Calificaciones de un curso</h2>
+  <form method="post" action="/calificaciones">
+    <p>Asignatura (pAsignatura): <input type="text" name="asignatura" placeholder="8108267" required></p>
+    <p>Curso (pCurso): <input type="text" name="curso" placeholder="1" required></p>
+    <p>Periodo (pPeriodo): <input type="text" name="periodo" placeholder="263" required></p>
+    <p>Cualitativa (cualitativa): <input type="text" name="cualitativa" placeholder="N" value="N" required></p>
+    <p>Parcial (pNroParcial): <input type="text" name="parcial" placeholder="Nota 2do 50%" required>
+       <br><small>Escríbelo tal cual, con espacios y %. Ej: Nota 2do 50%</small></p>
+    <p><button>Ver calificaciones</button></p>
+  </form></div>`
 
 // login: arma la URL con PKCE, recuerda el verifier en una cookie y redirige.
-func login(w http.ResponseWriter, r *http.Request) {
-	urlLogin, verifier, state := auth.URLLogin()
+func (s *sesion) login(w http.ResponseWriter, r *http.Request) {
+	urlLogin, verifier, state := s.portal.URLLogin()
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieLogin,
+		Name:     s.cookie,
 		Value:    state + "." + verifier,
 		Path:     "/",
 		MaxAge:   900, // 15 min para completar el login
@@ -146,7 +216,7 @@ func esHTTPS(r *http.Request) bool {
 }
 
 // callback: recibe la URL pegada, saca el code y lo cambia por el token.
-func callback(w http.ResponseWriter, r *http.Request) {
+func (s *sesion) callback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
@@ -158,13 +228,13 @@ func callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := r.Cookie(cookieLogin)
+	c, err := r.Cookie(s.cookie)
 	if err != nil || c.Value == "" {
 		paginaError(w, "No hay un login en curso (o ya expiró). Da clic en 'Abrir login UPTC' y pega la URL dentro de los 15 minutos.")
 		return
 	}
 	// El code es de un solo uso: borramos la cookie apenas la tomamos.
-	http.SetCookie(w, &http.Cookie{Name: cookieLogin, Path: "/", MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: s.cookie, Path: "/", MaxAge: -1})
 
 	state, verifier, ok := strings.Cut(c.Value, ".")
 	if !ok || verifier == "" {
@@ -177,15 +247,12 @@ func callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := auth.IntercambiarCode(code, verifier)
+	t, err := s.portal.IntercambiarCode(code, verifier)
 	if err != nil {
 		paginaError(w, "No se pudo obtener el token: "+err.Error()+" (el código dura ~1 minuto; repite el login).")
 		return
 	}
-	mu.Lock()
-	ultimoToken = t
-	mu.Unlock()
-	_ = auth.Guardar(t)
+	s.guardar(t)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -195,7 +262,7 @@ func horario(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	t, err := tokenValido()
+	t, err := est.tokenValido()
 	if err != nil {
 		paginaError(w, err.Error())
 		return
@@ -240,7 +307,7 @@ func notas(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	t, err := tokenValido()
+	t, err := est.tokenValido()
 	if err != nil {
 		paginaError(w, err.Error())
 		return
@@ -279,7 +346,7 @@ func perfil(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	t, err := tokenValido()
+	t, err := est.tokenValido()
 	if err != nil {
 		paginaError(w, err.Error())
 		return
@@ -318,7 +385,7 @@ func foto(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	t, err := tokenValido()
+	t, err := est.tokenValido()
 	if err != nil {
 		paginaError(w, err.Error())
 		return
@@ -353,28 +420,116 @@ func foto(w http.ResponseWriter, r *http.Request) {
 		vista.FotoHTML(estudiante, body)))
 }
 
-// tokenValido devuelve un token usable, renovándolo si hace falta.
-func tokenValido() (*auth.Token, error) {
-	mu.Lock()
-	t := ultimoToken
-	mu.Unlock()
+// horarioDocente: renueva el token docente si venció y muestra el horario del profesor.
+// Por ahora devuelve el JSON crudo; cuando conozcamos su forma armamos la vista.
+func horarioDocente(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	t, err := doc.tokenValido()
+	if err != nil {
+		paginaError(w, err.Error())
+		return
+	}
+
+	idPeriodo := r.FormValue("periodo")
+	idProfesor := r.FormValue("profesor")
+	cliente := siweb.Nuevo(t.AccessToken, "")
+	body, codigoHTTP, err := cliente.HorarioDocente(idPeriodo, idProfesor)
+	if err != nil {
+		paginaError(w, "Error al consultar: "+err.Error())
+		return
+	}
+	if codigoHTTP == 401 {
+		paginaError(w, "El token no fue aceptado. Inicia sesión de nuevo.")
+		return
+	}
+
+	// Reusamos la misma grilla del estudiante; si el JSON no encaja, mostramos el crudo.
+	clases, err := siweb.ParsearHorarioDocente(body)
+	if err != nil || len(clases) == 0 {
+		pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Resultado (HTTP %d)</h2>
+  <textarea readonly style="height:360px">%s</textarea>
+  <p><a href="/">Volver</a></p></div>`, codigoHTTP, html.EscapeString(bonito(body))))
+		return
+	}
+
+	titulo := fmt.Sprintf("Periodo %s · Profesor %s", idPeriodo, idProfesor)
+	pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Horario docente</h2>%s
+  <details style="margin-top:1rem"><summary>Ver JSON original</summary>
+    <textarea readonly style="height:300px">%s</textarea></details>
+  <p><a href="/">Volver / consultar otro</a></p></div>`,
+		vista.HorarioHTML(clases, titulo), html.EscapeString(bonito(body))))
+}
+
+// calificaciones: renueva el token docente si venció y muestra las notas del curso.
+// Por ahora devuelve el JSON crudo; cuando conozcamos su forma armamos la vista.
+func calificaciones(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	t, err := doc.tokenValido()
+	if err != nil {
+		paginaError(w, err.Error())
+		return
+	}
+
+	asignatura := r.FormValue("asignatura")
+	curso := r.FormValue("curso")
+	periodo := r.FormValue("periodo")
+	cualitativa := r.FormValue("cualitativa")
+	parcial := r.FormValue("parcial")
+
+	cliente := siweb.Nuevo(t.AccessToken, "")
+	body, codigoHTTP, err := cliente.Calificaciones(asignatura, curso, periodo, cualitativa, parcial)
+	if err != nil {
+		paginaError(w, "Error al consultar: "+err.Error())
+		return
+	}
+	if codigoHTTP == 401 {
+		paginaError(w, "El token no fue aceptado. Inicia sesión de nuevo.")
+		return
+	}
+
+	filas, err := siweb.ParsearCalificaciones(body)
+	if err != nil || len(filas) == 0 {
+		pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Resultado (HTTP %d)</h2>
+  <textarea readonly style="height:360px">%s</textarea>
+  <p><a href="/">Volver</a></p></div>`, codigoHTTP, html.EscapeString(bonito(body))))
+		return
+	}
+
+	titulo := fmt.Sprintf("Asignatura %s · curso %s · periodo %s · %s", asignatura, curso, periodo, parcial)
+	pagina(w, http.StatusOK, fmt.Sprintf(`
+<div class="caja"><h2>Calificaciones</h2>%s
+  <details style="margin-top:1rem"><summary>Ver JSON original</summary>
+    <textarea readonly style="height:300px">%s</textarea></details>
+  <p><a href="/">Volver / consultar otro</a></p></div>`,
+		vista.CalificacionesHTML(filas, titulo), html.EscapeString(bonito(body))))
+}
+
+// tokenValido devuelve un token usable del portal, renovándolo si hace falta.
+func (s *sesion) tokenValido() (*auth.Token, error) {
+	t := s.actual()
 	if t == nil {
-		return nil, fmt.Errorf("todavía no has iniciado sesión")
+		return nil, fmt.Errorf("todavía no has iniciado sesión como %s", s.nombre)
 	}
 	if !t.Expirado() {
 		return t, nil
 	}
 	if t.RefreshToken == "" {
-		return nil, fmt.Errorf("la sesión venció. Inicia sesión de nuevo")
+		return nil, fmt.Errorf("la sesión de %s venció. Inicia sesión de nuevo", s.nombre)
 	}
-	nuevo, err := auth.Refrescar(t.RefreshToken)
+	nuevo, err := s.portal.Refrescar(t.RefreshToken)
 	if err != nil {
-		return nil, fmt.Errorf("no se pudo renovar la sesión (ya caducó en la UPTC). Inicia sesión de nuevo")
+		return nil, fmt.Errorf("no se pudo renovar la sesión de %s (ya caducó en la UPTC). Inicia sesión de nuevo", s.nombre)
 	}
-	mu.Lock()
-	ultimoToken = nuevo
-	mu.Unlock()
-	_ = auth.Guardar(nuevo)
+	s.guardar(nuevo)
 	return nuevo, nil
 }
 
